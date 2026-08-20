@@ -2,3 +2,8 @@
 /raster_mosaicking/rasters
 /raster_mosaicking/AOI
 /raster_mosaicking/clipped_output
+.vscode/settings.json
+/remap_classes.egg-info
+binary_downsampling/__pycache__/downsample_raster.cpython-312.pyc
+/tests/__pycache__
+/raster_mosaicking/__pycache__

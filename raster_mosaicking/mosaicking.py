@@ -9,18 +9,12 @@ WHAT IT DOES
 1. For each commodity/year folder, discovers every .tif tile inside it
    (country-level tiles, plus Indonesia's multi-island / auto-sharded
    exports such as cocoa_binary_IDN_ISLD_2020-0000000000-0000000000).
-2. Reprojects any tile that isn't EPSG:4326 on the fly (nearest-neighbour,
-   since the data is categorical 0/1 -> no interpolation allowed).
-3. Writes every tile into one shared output canvas, one small window at a
-   time (not one giant in-memory array). This is the fix for the OOM you
-   hit mosaicking the 10 m rice rasters over the full SEA extent: memory
-   use here is bounded by the size of a single input tile, never by the
-   size of the full SEA mosaic.
-4. Where tiles overlap (e.g. shard seams), combines with np.maximum so a
-   "presence" (1) from any tile always wins over "absence" (0) — safe for
-   binary data and avoids seam artifacts overwriting good pixels.
-5. Optionally clips the final mosaic to the dissolved AOI boundary from
-   the master shapefile, to trim any warp halo beyond real land area.
+2. Merges all tiles with rasterio.merge using the binary-safe ``max`` rule,
+    so a presence (1) always wins over absence (0) in overlaps.
+3. Streams the merge to disk in bounded windows, avoiding one giant
+    in-memory array for large regional mosaics.
+4. Optionally clips the final mosaic to the dissolved AOI boundary from the
+    master shapefile, to trim pixels outside the AOI.
 
 OUTPUT
 ------
@@ -36,31 +30,36 @@ import re
 import numpy as np
 import geopandas as gpd
 import rasterio
-from rasterio.crs import CRS
+from rasterio.merge import merge
 from pathlib import Path
+from rasterio.crs import CRS
+from rasterio.vrt import WarpedVRT
 from rasterio.warp import transform_bounds, reproject, calculate_default_transform, Resampling
 from rasterio.windows import Window, from_bounds, transform as window_transform
 from rasterio.transform import from_origin
 from rasterio.mask import mask as rio_mask
+from rasterio.features import geometry_mask
 
 # --------------------------------------------------------------------------
 # CONFIG - edit paths here
 # --------------------------------------------------------------------------
 folders_2020 = [
-    Path(r"C:\FAO_commodities_presence_absence\raw_ee\cocoa_2020"),
-    Path(r"C:\FAO_commodities_presence_absence\raw_ee\coffee_2020"),
-    Path(r"C:\FAO_commodities_presence_absence\raw_ee\palm_2020"),
-    Path(r"C:\FAO_commodities_presence_absence\raw_ee\rubber_2020"),
-    Path(r"C:\FAO_commodities_presence_absence\raw_ee\maize_2020"),
-    Path(r"C:\FAO_commodities_presence_absence\raw_ee\timber_2020"),
+    #Path(r"C:\FAO_commodities_presence_absence\raw_ee\cocoa_2020"),
+    #Path(r"C:\FAO_commodities_presence_absence\raw_ee\coffee_2020"),
+    #Path(r"C:\FAO_commodities_presence_absence\raw_ee\palm_2020"),
+    #Path(r"C:\FAO_commodities_presence_absence\raw_ee\rubber_2020"),
+    #Path(r"C:\FAO_commodities_presence_absence\raw_ee\maize_2020"),
+    #Path(r"C:\FAO_commodities_presence_absence\raw_ee\timber_2020"),
+    Path(r"C:\FAO_commodities_presence_absence\intermediate_process\rice_2020"),
+    
 ]
 folders_2025 = [
-    Path(r"C:\FAO_commodities_presence_absence\raw_ee\cocoa_2025"),
-    Path(r"C:\FAO_commodities_presence_absence\raw_ee\coffee_2025"),
-    Path(r"C:\FAO_commodities_presence_absence\raw_ee\palm_2025"),
-    Path(r"C:\FAO_commodities_presence_absence\raw_ee\rubber_2025"),
-    Path(r"C:\FAO_commodities_presence_absence\raw_ee\maize_2025"),
-    Path(r"C:\FAO_commodities_presence_absence\raw_ee\timber_2025"),
+    #Path(r"C:\FAO_commodities_presence_absence\raw_ee\cocoa_2025"),
+    #Path(r"C:\FAO_commodities_presence_absence\raw_ee\coffee_2025"),
+    #Path(r"C:\FAO_commodities_presence_absence\raw_ee\palm_2025"),
+    #Path(r"C:\FAO_commodities_presence_absence\raw_ee\rubber_2025"),
+    #Path(r"C:\FAO_commodities_presence_absence\raw_ee\maize_2025"),
+    Path(r"C:\FAO_commodities_presence_absence\intermediate_process\rice_2023"),
 ]
 
 master_shapefile_path = Path(
@@ -106,12 +105,12 @@ def list_tif_files(folder: Path):
 def compute_dst_grid(files, target_crs=TARGET_CRS):
     """
     Union bounds across all source tiles (expressed in target_crs), combined
-    with the native source resolution when all sources already use target_crs.
-    Returns
+    with the native source resolution when all sources already use target_crs
+    (falls back to TARGET_RESOLUTION_DEG otherwise). Returns
     (transform, width, height).
 
-    The bounds are snapped to the reference raster's pixel grid. This avoids
-    a fractional-pixel shift that would make rasterio resample otherwise
+    Bounds are snapped to the reference raster's pixel grid to avoid a
+    fractional-pixel shift that would make rasterio resample otherwise
     identical source tiles during the merge.
     """
     minx = miny = np.inf
@@ -140,8 +139,6 @@ def compute_dst_grid(files, target_crs=TARGET_CRS):
             maxx = max(maxx, bounds_t[2])
             maxy = max(maxy, bounds_t[3])
 
-            # diagnostic only -- confirms what the source file's native
-            # resolution actually is, in its own CRS units
             print(f"    [DIAG] {f.name}: crs={src.crs}, res={src.res}, size={src.width}x{src.height}")
 
     if native_grid and reference_res is not None and reference_origin is not None:
@@ -162,6 +159,33 @@ def compute_dst_grid(files, target_crs=TARGET_CRS):
     return dst_transform, width, height
 
 
+def extract_iso3(filename: str, commodity: str):
+    """
+    cocoa_binary_KHM_2020.tif -> 'KHM'
+    cocoa_binary_IDN_ISLD_2020-0000000000-0000000000.tif -> 'IDN'
+    (island/shard suffixes are ignored -- they all belong to the same country
+    polygon for clipping purposes)
+    """
+    m = re.search(rf"{re.escape(commodity)}_binary_([A-Z]{{3}})", filename)
+    return m.group(1) if m else None
+
+
+def build_country_geometries(shapefile_path: Path, target_crs=TARGET_CRS):
+    """
+    Loads the master AOI shapefile once and returns a dict of
+    {ISO_A3: [shapely geometries]} in target_crs, for per-tile clipping.
+    Countries with multiple polygon parts (e.g. archipelagos) keep all parts.
+    """
+    gdf = gpd.read_file(shapefile_path)
+    if gdf.crs is None or gdf.crs.to_string() != target_crs:
+        gdf = gdf.to_crs(target_crs)
+
+    geoms_by_iso3 = {}
+    for iso3, group in gdf.groupby("ISO_A3"):
+        geoms_by_iso3[iso3] = list(group.geometry)
+    return geoms_by_iso3
+
+
 def mosaic_folder(folder: Path, output_dir: Path):
     commodity, year = parse_folder_name(folder)
     print(f"\n=== {commodity} {year} ===")
@@ -170,63 +194,57 @@ def mosaic_folder(folder: Path, output_dir: Path):
     if not files:
         return
 
-    print("  Computing output grid...")
-    dst_transform, dst_width, dst_height = compute_dst_grid(files)
-    print(f"  Grid: {dst_width} x {dst_height} px, res={dst_transform.a:.8f} deg")
-
+    print("  Preparing merge...")
     output_dir.mkdir(parents=True, exist_ok=True)
-    out_path = output_dir / f"{commodity}_combine_{year}_SEA.tif"
+    out_path = output_dir / f"{commodity}_combine_{year}_final.tif"
 
-    profile = {
-        "driver": "GTiff",
-        "dtype": DTYPE,
-        "count": 1,
-        "height": dst_height,
-        "width": dst_width,
-        "crs": TARGET_CRS,
-        "transform": dst_transform,
-        "compress": "lzw",
-        "tiled": True,
-        "blockxsize": 256,
-        "blockysize": 256,
-        "nodata": 0,
-    }
+    print(f"  Reprojecting sources to {TARGET_CRS} as needed...")
+    source_files = [rasterio.open(path) for path in files]
+    src_files = []
+    try:
+        for path, src in zip(files, source_files):
+            if src.crs is None:
+                raise ValueError(f"Raster has no CRS and cannot be standardized: {path}")
 
-    with rasterio.open(out_path, "w+", **profile) as dst:
-        for f in files:
-            with rasterio.open(f) as src:
-                src_bounds_t = transform_bounds(src.crs, TARGET_CRS, *src.bounds, densify_pts=21)
+            vrt = WarpedVRT(
+                src,
+                crs=TARGET_CRS,
+                resampling=Resampling.nearest,
+                src_nodata=src.nodata if src.nodata is not None else FILL_VALUE,
+                nodata=FILL_VALUE,
+            )
+            src_files.append(vrt)
 
-                win = from_bounds(*src_bounds_t, transform=dst_transform)
-                win = win.round_offsets(op="floor").round_lengths(op="ceil")
-                win = win.intersection(Window(0, 0, dst_width, dst_height)) # type: ignore
+            if src.crs != CRS.from_string(TARGET_CRS):
+                print(f"    standardized {path.name}: {src.crs} -> {TARGET_CRS}")
 
-                if win.width <= 0 or win.height <= 0:
-                    print(f"    [SKIP] {f.name} falls outside output grid")
-                    continue
+        output_profile = src_files[0].profile.copy()
+        output_profile.update(
+            driver="GTiff",
+            nodata=FILL_VALUE,
+            compress="lzw",
+            tiled=True,
+            blockxsize=256,
+            blockysize=256,
+            BIGTIFF="IF_SAFER",
+        )
 
-                win_transform = window_transform(win, dst_transform)
-                w_h, w_w = int(round(win.height)), int(round(win.width))
-
-                local = np.full((w_h, w_w), FILL_VALUE, dtype=DTYPE)
-
-                reproject(
-                    source=rasterio.band(src, 1),
-                    destination=local,
-                    src_transform=src.transform,
-                    src_crs=src.crs,
-                    src_nodata=src.nodata,
-                    dst_transform=win_transform,
-                    dst_crs=TARGET_CRS,
-                    dst_nodata=FILL_VALUE,
-                    resampling=Resampling.nearest,
-                )
-
-                existing = dst.read(1, window=win)
-                merged = np.maximum(existing, local).astype(DTYPE)
-                dst.write(merged, 1, window=win)
-
-                print(f"    merged {f.name}")
+        print(f"  Merging {len(files)} rasters with max overlap rule...")
+        # This is the notebook's merge logic, written directly to disk so
+        # memory use is bounded instead of allocating the full mosaic.
+        merge(
+            src_files,
+            method="max",
+            nodata=FILL_VALUE,
+            mem_limit=128,
+            dst_path=out_path,
+            dst_kwds=output_profile,
+        )
+    finally:
+        for src in src_files:
+            src.close()
+        for src in source_files:
+            src.close()
 
     print(f"  Wrote {out_path}")
 
