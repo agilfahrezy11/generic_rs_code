@@ -7,3 +7,4 @@
 binary_downsampling/__pycache__/downsample_raster.cpython-312.pyc
 /tests/__pycache__
 /raster_mosaicking/__pycache__
+/adaptive_workflow_dtl

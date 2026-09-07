@@ -54,12 +54,12 @@ folders_2020 = [
     
 ]
 folders_2025 = [
-    #Path(r"C:\FAO_commodities_presence_absence\raw_ee\cocoa_2025"),
-    #Path(r"C:\FAO_commodities_presence_absence\raw_ee\coffee_2025"),
-    #Path(r"C:\FAO_commodities_presence_absence\raw_ee\palm_2025"),
-    #Path(r"C:\FAO_commodities_presence_absence\raw_ee\rubber_2025"),
+    Path(r"C:\FAO_commodities_presence_absence\raw_ee\cocoa_2025"),
+    Path(r"C:\FAO_commodities_presence_absence\raw_ee\coffee_2025"),
+    Path(r"C:\FAO_commodities_presence_absence\raw_ee\palm_2025"),
+    Path(r"C:\FAO_commodities_presence_absence\raw_ee\rubber_2025"),
     #Path(r"C:\FAO_commodities_presence_absence\raw_ee\maize_2025"),
-    Path(r"C:\FAO_commodities_presence_absence\intermediate_process\rice_2023"),
+    #Path(r"C:\FAO_commodities_presence_absence\intermediate_process\rice_2023"),
 ]
 
 master_shapefile_path = Path(
